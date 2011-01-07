@@ -1,0 +1,147 @@
+#!/bin/bash
+# Author: Björn Andersson <bjorn.andersson@piratpartiet.se>
+#
+# Piratpartiet has two servers running Varnish and keeping them both in sync
+# started to get cumbersome. A quick search on Google gave nothing so I wrote
+# this script to ease the maintenance of activating new configurations on
+# a Varnish farm.
+#
+# How the script works:
+# - The directory holding the varnish configuration will be synced to all
+#   hosts in $HOSTS using ssh as carrier
+# - The currently active configuration on all hosts get cached
+#   in case something goes awry this configuration will get activated again
+# - All hosts will get the new configuration loaded.
+#   If you pass an argument that name will be used + the current date and time
+# - The configuration will be activated on all hosts, if an error occurs all
+#   hosts that managed to get the new configuration activated will get their
+#   configurations reverted to the old configuration.
+#
+
+###
+# Configure to suit your farm
+HOSTS=(morgan rackham)
+VARNISH_PATH=/etc/varnish/
+VARNISH_VCL=/etc/varnish/vcl.conf
+ADMIN_PORT=6082
+RSYNC_PARAMS=-a
+RSYNC_USER=varnishsync
+VARNISHADM_PARAMS=''
+
+###################
+# Don't edit below
+
+source /etc/default/varnish
+
+CONF_NAME=''
+if [ "${1}" = "" ] ; then
+    CONF_NAME=`date "+reload-%Y%m%d-%H%M.%S"`
+else
+    CONF_NAME=`date "+${1}-%Y%m%d-%H%M.%S"`
+fi
+
+function copy_configuration_to
+{
+    HOST=$1
+    `rsync $RSYNC_PARAMS $VARNISH_PATH $RSYNC_USER@$HOST:$VARNISH_PATH`
+}
+
+function load_configuration_on
+{
+    HOST=$1
+    CONFIG_NAME=$2
+    eval ssh $RSYNC_USER@$HOST "varnishadm -T localhost:$ADMIN_PORT $VARNISHADM_PARAMS vcl.load $CONFIG_NAME $VARNISH_VCL > /dev/null"
+}
+
+function use_configuration_on
+{
+    HOST=$1
+    CONFIG_NAME=$2
+    eval ssh $RSYNC_USER@$HOST "varnishadm -T localhost:$ADMIN_PORT $VARNISHADM_PARAMS vcl.use $CONFIG_NAME"
+}
+
+function old_configuration_name_on
+{
+    HOST=$1
+    eval ssh $RSYNC_USER@$HOST "varnishadm -T localhost:$ADMIN_PORT $VARNISHADM_PARAMS vcl.list | awk '/active/ {print \$3}'"
+}
+
+function did_an_error_occur
+{
+    return_code=$1
+    exit_code=$2
+    message_on_error=$3
+    if [ "${return_code}" != "0" ] ; then
+        echo $message_on_error
+        exit $exit_code
+    fi
+}
+
+PREVIOUS_CONFIG=()
+
+i=0
+while [ "$i" -lt "${#HOSTS[@]}" ] ; do
+    HOST=${HOSTS[$i]}
+
+    i=`expr $i + 1`
+    if [ $HOST = $INSTANCE ] ; then continue ; fi
+
+    copy_configuration_to $HOST
+    did_an_error_occur $? 1 "Error copying configuration to host ${HOST}!"
+done
+
+i=0
+while [ "$i" -lt "${#HOSTS[@]}" ] ; do
+    conf=$(old_configuration_name_on ${HOSTS[${i}]})
+    did_an_error_occur $? 2 "An error occured trying to get the previous configuration name!"
+
+    PREVIOUS_CONFIG[$i]=$conf
+    i=`expr $i + 1`
+done
+
+# Time to start loading the configurations
+i=0
+while [ "$i" -lt "${#HOSTS[@]}" ] ; do
+    HOST=${HOSTS[$i]}
+    load_configuration_on $HOST $CONF_NAME
+    did_an_error_occur $? 3 "Something went badly when trying to load the new configuration!"
+
+    i=`expr $i + 1`
+done
+
+# Now all hosts should've loaded the new conf without problems so try and activate it.
+# If something goes wrong with the activation revisit the previously done
+# hosts, if any, and load their previous config instead
+i=0
+while [ "$i" -lt "${#HOSTS[@]}" ] ; do
+    HOST=${HOSTS[$i]}
+    use_configuration_on $HOST $CONF_NAME
+
+    if [ "$?" != "0" ] ; then
+        echo "An error occured trying to activate the new configuration on ${HOST}!"
+
+        if [ "$i" -ne "0" ] ; then
+            echo "Will try to re-active the old configuration on the hosts that succeeded"
+
+            j=0
+            while [ "$j" -lt "$i" ] ; do
+                old_host=${HOSTS[$j]}
+                prev_conf=${PREVIOUS_CONFIG[$j]}
+                use_configuration_on $old_host $prev_conf
+                if [ "$?" -eq "0" ] ; then
+                    echo "${old_host} reverted to ${prev_conf}"
+                else
+                    echo "An error occured trying to revert ${old_host} to ${prev_conf}"
+                    exit 5
+
+                fi
+
+                j=`expr $j + 1`
+            done
+
+            exit 4
+        fi
+    fi
+
+    i=`expr $i + 1`
+done
